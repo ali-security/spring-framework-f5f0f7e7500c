@@ -26,6 +26,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -33,6 +34,7 @@ import java.util.function.Consumer;
 
 import org.junit.jupiter.api.Test;
 import org.reactivestreams.Subscription;
+import reactor.core.Disposable;
 import reactor.core.publisher.BaseSubscriber;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -242,6 +244,46 @@ public class SynchronossPartHttpMessageReaderTests extends AbstractLeakCheckingT
 		DataBuffer buffer = DataBufferUtils.join(parts.getFirst("filePart").content()).block();
 		assertThat(buffer.readableByteCount()).isEqualTo(content.length);
 		DataBufferUtils.release(buffer);
+	}
+
+	@Test // CVE-2026-22740
+	void partsAreDeletedWhenReadIsCancelled() throws IOException {
+		Path tempDirectory = Paths.get(System.getProperty("java.io.tmpdir"));
+		Set<Path> directoriesBefore = listFiles(tempDirectory, "synchronoss-file-upload-*");
+
+		SynchronossPartHttpMessageReader synchronossReader = new SynchronossPartHttpMessageReader();
+		MultipartHttpMessageReader multipartReader = new MultipartHttpMessageReader(synchronossReader);
+
+		// A file part larger than maxInMemorySize, so it is stored in a file,
+		// followed by a part whose body never completes
+		String boundary = "cve-2026-22740";
+		byte[] head = ("--" + boundary + "\r\nContent-Disposition: form-data; name=\"filePart\"; " +
+				"filename=\"large.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n").getBytes(UTF_8);
+		byte[] tail = ("\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"textPart\"" +
+				"\r\n\r\nincomplete").getBytes(UTF_8);
+		byte[] content = new byte[head.length + synchronossReader.getMaxInMemorySize() * 2 + tail.length];
+		System.arraycopy(head, 0, content, 0, head.length);
+		System.arraycopy(tail, 0, content, content.length - tail.length, tail.length);
+		int chunkSize = 4096;
+		Flux<DataBuffer> body = Flux.range(0, (content.length + chunkSize - 1) / chunkSize)
+				.map(i -> this.bufferFactory.wrap(Arrays.copyOfRange(
+						content, i * chunkSize, Math.min(content.length, (i + 1) * chunkSize))))
+				.concatWith(Flux.never());
+		ServerHttpRequest request = MockServerHttpRequest.post("/")
+				.contentType(MediaType.parseMediaType("multipart/form-data;boundary=" + boundary))
+				.body(body);
+
+		Disposable subscription = multipartReader.readMono(PARTS_ELEMENT_TYPE, request, emptyMap()).subscribe();
+
+		Set<Path> directories = listFiles(tempDirectory, "synchronoss-file-upload-*");
+		directories.removeAll(directoriesBefore);
+		assertThat(directories).hasSize(1);
+		Path fileStorageDirectory = directories.iterator().next();
+		assertThat(listFiles(fileStorageDirectory, "*")).isNotEmpty();
+
+		// Cancelling the request discards the parts collected so far
+		subscription.dispose();
+		assertThat(listFiles(fileStorageDirectory, "*")).isEmpty();
 	}
 
 	private static Set<Path> listFiles(Path directory, String glob) throws IOException {

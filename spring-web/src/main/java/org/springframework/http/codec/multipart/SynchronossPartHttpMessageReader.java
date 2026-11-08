@@ -195,6 +195,16 @@ public class SynchronossPartHttpMessageReader extends LoggingCodecSupport implem
 		return Mono.error(new UnsupportedOperationException("Cannot read multipart request body into single Part"));
 	}
 
+	/**
+	 * Release the body storage, and any temporary file, of a part created by
+	 * this reader. Parts created by other readers are left untouched.
+	 */
+	static void disposeStorage(Part part) {
+		if (part instanceof SynchronossPart) {
+			((SynchronossPart) part).getStorage().dispose();
+		}
+	}
+
 	private Mono<Path> getFileStorageDirectory() {
 		return Mono.defer(() -> {
 			Path directory = this.fileStorageDirectory.get();
